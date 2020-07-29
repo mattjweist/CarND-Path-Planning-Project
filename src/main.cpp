@@ -7,6 +7,7 @@
 #include "Eigen-3.3/Eigen/QR"
 #include "helpers.h"
 #include "json.hpp"
+#include "spline.h"
 
 // for convenience
 using nlohmann::json;
@@ -49,9 +50,17 @@ int main() {
     map_waypoints_dx.push_back(d_x);
     map_waypoints_dy.push_back(d_y);
   }
+  
+  // start in lane 1
+  int lane = 1;
+  
+  // Starting velocity
+  double ref_vel = 0.0; // mph
+  
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,
-               &map_waypoints_dx,&map_waypoints_dy]
+
+  h.onMessage([&ref_vel,&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,
+               &map_waypoints_dx,&map_waypoints_dy,&lane]
               (uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
@@ -87,18 +96,259 @@ int main() {
           // Sensor Fusion Data, a list of all other cars on the same side 
           //   of the road.
           auto sensor_fusion = j[1]["sensor_fusion"];
-
-          json msgJson;
-
-          vector<double> next_x_vals;
-          vector<double> next_y_vals;
-
+          
+          
           /**
            * TODO: define a path made up of (x,y) points that the car will visit
            *   sequentially every .02 seconds
            */
+          
+          
+          int prev_size = previous_path_x.size();    
+          
+          if(prev_size > 0) {
+            car_s = end_path_s;
+          }
+          
+          bool too_close_keep = false;
+          bool too_close_left = false;
+          bool too_close_right = false;
+          
+          // safe gap between vehicles using 3 second rule
+          double safe_gap = car_speed / 3600 * 1609.34 * 2; // (miles/hour) / (seconds/hour) * (meters/mile) * (2 seconds buffer)
+          /*
+          if (safe_gap < 0.0001) {
+            safe_gap = 10; // maintain a gap of at least 10m
+          }
+          */
+          
+          std::cout << "     " << std::endl;
+          std::cout << "lane = " << lane << std::endl;
+          std::cout << "safe gap = " << safe_gap << std::endl;
+          
+          // checking other cars
+          for(int i = 0; i < sensor_fusion.size(); i++) {
+            float d = sensor_fusion[i][6]; // lateral position
+            // if car is in my lane
+            if(d < (4+4*lane) && d > (4*lane) ) {
+              double vx = sensor_fusion[i][3];
+              double vy = sensor_fusion[i][4];
+              double check_speed = sqrt(vx*vx + vy*vy);
+              double check_car_s = sensor_fusion[i][5];
+              // project the other car's position
+              check_car_s += ((double)prev_size*.02*check_speed);
+              // set the flag if the gap is too small
+              // check if other car's s values are greater than ours and if the gap is too small
+              if((check_car_s > car_s) && ((check_car_s - car_s) < safe_gap) ) {
+                too_close_keep = true;
+              }
+            }
+          }
+          
+          
+          // if too close to car in front, check the left lane
+          if(too_close_keep) {
+              std::cout << "too close to stay" << std::endl;
 
+              // if we are not in the leftmost lane
+              if(lane > 0) {
+                  // checking other cars
+                  for(int i = 0; i < sensor_fusion.size(); i++) {
+                      float d = sensor_fusion[i][6]; // lateral position
+                      // if car is to the left
+                      if(d < (4*lane) && d > (4*(lane)-4) ) {
+                          double vx = sensor_fusion[i][3];
+                          double vy = sensor_fusion[i][4];
+                          double check_speed = sqrt(vx*vx + vy*vy);
+                          double check_car_s = sensor_fusion[i][5];
+                          // project the other car's position
+                          // check_car_s += ((double)prev_size*.02*check_speed);
 
+                          // set the flag if the gap is too small
+                          // switch lanes if the gap is large enough
+                          if(fabs(check_car_s - car_s) < safe_gap) {
+                              too_close_left = true; 
+                          }
+                      }
+                  }
+              } else {
+                // if we are already in the leftmost lane, set the flag
+                too_close_left = true;
+              }
+          }
+          
+          
+          // if gap on left is too small or we are in the leftmost lane, check the gap on the right
+          if(too_close_left) {
+              std::cout << "too close left" << std::endl;
+              
+              // if we are not in the rightmost lane
+              if(lane < 2) {
+                  // checking other cars
+                  for(int i = 0; i < sensor_fusion.size(); i++) {
+                      float d = sensor_fusion[i][6]; // lateral position
+                      // if car is to the right
+                      if(d < (8+4*lane) && d > (4+4*lane) ) {
+                          double vx = sensor_fusion[i][3];
+                          double vy = sensor_fusion[i][4];
+                          double check_speed = sqrt(vx*vx + vy*vy);
+                          double check_car_s = sensor_fusion[i][5];
+                          // project the other car's position
+                          // check_car_s += ((double)prev_size*.02*check_speed);
+                        
+                          // set the flag if the gap is too small
+                          // switch lanes if the gap is large enough
+                          if(fabs(check_car_s - car_s) < safe_gap) {
+                                too_close_right = true;
+                          }
+                      }
+                  }
+              } 
+              // if we are in the rightmost lane, set the flag
+              else {
+                too_close_right = true;
+              }
+          }
+
+            
+          // if there are no openings, just deccelerate
+          if(too_close_right && too_close_left && too_close_keep) {
+            std::cout << "nowhere to go, deccelerating" << std::endl;
+            ref_vel -= 0.5; // deccelerate  
+          } 
+          else if (too_close_keep && too_close_left) {
+            std::cout << "entering lane " << lane+1 << std::endl;
+            lane++;
+          }
+          else if (too_close_keep) {
+            std::cout << "entering lane " << lane-1 << std::endl;
+            lane--;
+          }
+          // otherwise, make sure we are driving fast
+          else if(ref_vel < 49.5) {
+            ref_vel += .25; // accelerate
+            std::cout << "accelerating" << std::endl;
+          }
+          
+          
+          // create list of widely spaced waypoints evenly spaced
+          // points will be interpolated with a spline
+          vector<double> ptsx;
+          vector<double> ptsy;
+          
+          // reference x, y, yaw states
+          // reference the starting point as A) where the car is or B) previous path's end point
+          double ref_x = car_x;
+          double ref_y = car_y;
+          double ref_yaw = deg2rad(car_yaw);
+          
+          // if previous size is almost empty, use the car as starting reference
+          if(prev_size < 2) {
+            // use two points that make the path tangent to the car
+            double prev_car_x = car_x - cos(car_yaw);
+            double prev_car_y = car_y - sin(car_yaw);
+            
+            ptsx.push_back(prev_car_x);
+            ptsx.push_back(car_x);
+            
+            ptsy.push_back(prev_car_y);
+            ptsy.push_back(car_y);
+          }
+          // otherwise, use the previous path's end point as starting reference
+          else {
+            
+            // redefine reference states as previous path's end point
+            ref_x  = previous_path_x[prev_size-1];
+            ref_y = previous_path_y[prev_size-1];
+            
+            double ref_x_prev = previous_path_x[prev_size-2];
+            double ref_y_prev = previous_path_y[prev_size-2];
+            ref_yaw = atan2(ref_y - ref_y_prev, ref_x - ref_x_prev);
+            
+            // use two points that make the path tangent to the previous path's end point
+            ptsx.push_back(ref_x_prev);
+            ptsx.push_back(ref_x);
+            
+            ptsy.push_back(ref_y_prev);
+            ptsy.push_back(ref_y);
+            
+          }
+          
+          // In Frenet add evenly spaced points ahead of the starting reference
+          double spacing = 30.0;
+          vector<double> next_wp0 = getXY(car_s+spacing,(2+4*lane),map_waypoints_s,map_waypoints_x,map_waypoints_y);
+          vector<double> next_wp1 = getXY(car_s+2*spacing,(2+4*lane),map_waypoints_s,map_waypoints_x,map_waypoints_y);
+          vector<double> next_wp2 = getXY(car_s+3*spacing,(2+4*lane),map_waypoints_s,map_waypoints_x,map_waypoints_y);
+          vector<double> next_wp3 = getXY(car_s+4*spacing,(2+4*lane),map_waypoints_s,map_waypoints_x,map_waypoints_y);
+          vector<double> next_wp4 = getXY(car_s+5*spacing,(2+4*lane),map_waypoints_s,map_waypoints_x,map_waypoints_y);
+          
+          ptsx.push_back(next_wp0[0]);
+          ptsx.push_back(next_wp1[0]);
+          ptsx.push_back(next_wp2[0]);
+          ptsx.push_back(next_wp3[0]);
+          ptsx.push_back(next_wp4[0]);
+          
+          ptsy.push_back(next_wp0[1]);
+          ptsy.push_back(next_wp1[1]);
+          ptsy.push_back(next_wp2[1]);
+          ptsy.push_back(next_wp3[1]);
+          ptsy.push_back(next_wp4[1]);
+          
+          // shift coordinates to vehicle reference frame
+          for (int i = 0; i < ptsx.size(); i++) {
+            double shift_x = ptsx[i]-ref_x;
+            double shift_y = ptsy[i]-ref_y;
+            
+            ptsx[i] = (shift_x*cos(0-ref_yaw) - shift_y*sin(0-ref_yaw));
+            ptsy[i] = (shift_x*sin(0-ref_yaw) + shift_y*cos(0-ref_yaw));
+          }
+          
+          // create spline
+          tk::spline s;
+          
+          // set (x,y) points to the spline
+          s.set_points(ptsx,ptsy);
+          
+          // define the actual (x,y) points we will use for the planner
+          vector<double> next_x_vals;
+          vector<double> next_y_vals;
+
+          // start with all the previous path points from last time
+          for (int i = 0; i < previous_path_x.size(); i++) {
+            next_x_vals.push_back(previous_path_x[i]);
+            next_y_vals.push_back(previous_path_y[i]);
+          }
+
+          // calculate how to break up spline points so that we travel at our desired reference velocity
+          double target_x = spacing;
+          double target_y = s(target_x); // determine spline's corresponding y value for each x value
+          double target_dist = sqrt((target_x)*(target_x) + (target_y)*(target_y));
+          double x_add_on = 0;
+          
+          // fill up the rest of the path planner after filling it with previous points
+          // 50 points
+          for (int i = 1; i <= 50-previous_path_x.size(); i++) {
+            double N = (target_dist/(0.02*ref_vel/2.24)); // mph to m/s
+            double x_point = x_add_on + (target_x)/N;
+            double y_point = s(x_point);
+            
+            x_add_on = x_point;
+            
+            double x_ref = x_point;
+            double y_ref = y_point;
+            
+            // rotate back to normal after rotating it earlier
+            x_point = (x_ref*cos(ref_yaw) -y_ref*sin(ref_yaw));
+            y_point = (x_ref*sin(ref_yaw) + y_ref*cos(ref_yaw));
+            
+            x_point += ref_x;
+            y_point += ref_y;
+            
+            next_x_vals.push_back(x_point);
+            next_y_vals.push_back(y_point);
+          }
+            
+          json msgJson;
           msgJson["next_x"] = next_x_vals;
           msgJson["next_y"] = next_y_vals;
 
